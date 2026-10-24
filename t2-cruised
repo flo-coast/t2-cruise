@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# t2-cruised: cruise control for T2 MacBooks on Linux.
+# Copyright (C) 2026 flo-coast. Licensed under the GNU GPL v3 or later (see LICENSE).
+#
+# The Apple SMC runs a zone power controller: when the filtered CPU+GPU power PZ0F exceeds the
+# budget PZ0E, its throttle level PZ0T integrates up and it requests P-state limits
+# MSLC (CPU) and MSLG (GPU). macOS (X86PlatformPlugin PLimit) obeys them, so PZ0T settles
+# around 50. If nobody obeys, PZ0T reaches 100 and the SMC asserts PROCHOT: CPU at 800 MHz.
+# This daemon applies MSLC/MSLG as a CPU frequency cap (intel_pstate max_perf_pct) and an AMD
+# GPU power cap (amdgpu power1_cap). The SMC's own loop then finds the equilibrium, like on macOS.
+#
+# It only reads the SMC. The only things it writes are max_perf_pct and power1_cap, and it
+# restores both when it stops.
+#
+# Policies (POLICY in /etc/t2-cruise.conf, overridden at runtime by /run/t2-cruise/policy):
+#   apple     MSLC throttles the CPU, MSLG the GPU, the way macOS does it. Default.
+#   adaptive  EXPERIMENTAL. MSLC is split between CPU and GPU by the GPU's load: GPU near 100 %
+#             busy -> mostly the CPU is throttled; GPU waiting for the CPU -> mostly the GPU.
+#             In games this gave the same FPS as "apple" but felt less responsive (a GPU at
+#             ~100 % queues frames), so it stays opt-in for tinkering.
+import argparse, fcntl, glob, os, signal, struct, sys, time
+
+TESTED_MODELS = {"MacBookPro16,1"}
+CONF_FILE = "/etc/t2-cruise.conf"
+RUN_DIR = "/run/t2-cruise"
+POLICY_FILE = f"{RUN_DIR}/policy"
+CPU_BASE_FILE = f"{RUN_DIR}/cpu_max_mhz"   # optional CPU ceiling for the adaptive policy (e.g. a game profile)
+LOCK_FILE = f"{RUN_DIR}/smc.lock"          # other tools reading the SMC via key_at_index should take it too
+PSTATE = "/sys/devices/system/cpu/intel_pstate/max_perf_pct"
+INTERVAL = 0.5
+
+CONF = {                       # defaults, overridable in /etc/t2-cruise.conf
+    "POLICY": "apple",
+    "CPU_MIN_MHZ": 800,
+    "CPU_STEP_MHZ": 100,       # one MSLC step = one 100 MHz P-state
+    "GPU_STEP_W": 2.5,         # one MSLG step (of 16 Apple GPU states)
+    "ADAPTIVE_GPU_FLOOR_W": 25,
+    "ADAPTIVE_GPU_STEP_W": 1.25,
+    "ADAPTIVE_CPU_FLOOR_MHZ": 1600,
+    "ADAPTIVE_BUSY_GPU_BOUND": 95,   # GPU busy % at or above: all MSLC steps go to the CPU
+    "ADAPTIVE_BUSY_CPU_BOUND": 70,   # GPU busy % at or below: all MSLC steps go to the GPU
+    "ADAPTIVE_BUSY_TAU": 5.0,        # s, smoothing of the GPU load
+}
+
+def log(msg):
+    print(msg, flush=True)
+
+def load_conf():
+    try:
+        lines = open(CONF_FILE).read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.split("#")[0].strip()
+        if "=" not in line:
+            continue
+        k, v = (s.strip() for s in line.split("=", 1))
+        if k not in CONF:
+            log(f"{CONF_FILE}: unknown setting {k}, ignored")
+            continue
+        try:
+            CONF[k] = type(CONF[k])(v)
+        except ValueError:
+            log(f"{CONF_FILE}: bad value for {k}: {v!r}, using {CONF[k]}")
+
+def rd(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+def write(path, val):
+    try:
+        with open(path, "w") as f:
+            f.write(str(val))
+        return True
+    except OSError:
+        return False
+
+# ---------- hardware discovery ----------
+def find_smc():
+    for d in glob.glob("/sys/bus/acpi/drivers/applesmc/APP0001:*") + glob.glob("/sys/devices/platform/applesmc*"):
+        if os.path.exists(f"{d}/key_at_index"):
+            return d
+    sys.exit("applesmc with the key_at_index interface not found (is the applesmc module loaded?)")
+
+def find_gpu():
+    """the AMD dGPU with a power cap, or None"""
+    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        if rd(f"{dev}/vendor") != "0x1002" or not rd(f"{dev}/class", "").startswith("0x03"):
+            continue
+        hw = glob.glob(f"{dev}/hwmon/hwmon*/power1_cap")
+        if hw:
+            return dev, os.path.dirname(hw[0])
+    return None
+
+# ---------- SMC ----------
+class SMC:
+    def __init__(self, path, keys):
+        self.path = path
+        os.makedirs(RUN_DIR, exist_ok=True)
+        self.lockf = open(LOCK_FILE, "a")
+        self.index = {}
+        with self:
+            for i in range(int(rd(f"{path}/key_count"))):
+                self._select(i)
+                name = rd(f"{path}/key_at_index_name")
+                if name in keys:
+                    self.index[name] = i
+        missing = set(keys) - set(self.index)
+        if missing:
+            sys.exit(f"SMC keys {sorted(missing)} not found: this SMC doesn't seem to send P-state "
+                     f"limit requests, t2-cruise can't help here")
+
+    def __enter__(self):
+        fcntl.flock(self.lockf, fcntl.LOCK_EX)
+
+    def __exit__(self, *a):
+        fcntl.flock(self.lockf, fcntl.LOCK_UN)
+
+    def _select(self, i):
+        with open(f"{self.path}/key_at_index", "w") as f:
+            f.write(str(i))
+
+    def read(self, keys):
+        out = {}
+        with self:
+            for k in keys:
+                self._select(self.index[k])
+                with open(f"{self.path}/key_at_index_data", "rb") as f:
+                    out[k] = f.read()
+        return out
+
+flt = lambda b: struct.unpack("<f", b)[0]
+
+# ---------- policy ----------
+class Cruise:
+    def __init__(self, gpu, dry_run):
+        self.dry = dry_run
+        self.cpu_max = int(rd("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")) // 1000
+        self.gpu_dev, self.gpu_hw = gpu if gpu else (None, None)
+        self.gpu_max = self.gpu_min = None
+        if self.gpu_hw:
+            self.gpu_max = int(rd(f"{self.gpu_hw}/power1_cap_max")) / 1e6
+            self.gpu_min = int(rd(f"{self.gpu_hw}/power1_cap_min")) / 1e6
+        self.busy = 0.0
+
+    @property
+    def gpu_capable(self):
+        return self.gpu_hw is not None and self.gpu_min < self.gpu_max
+
+    def gpu_active(self):
+        return self.gpu_dev is not None and rd(f"{self.gpu_dev}/power/runtime_status") == "active"
+
+    def gpu_busy(self):
+        try:
+            return int(rd(f"{self.gpu_dev}/gpu_busy_percent"))
+        except (TypeError, ValueError):
+            return None
+
+    def policy(self):
+        p = rd(POLICY_FILE) or CONF["POLICY"]
+        return p if p in ("apple", "adaptive") else "apple"
+
+    def cpu_base(self):
+        try:
+            return min(self.cpu_max, int(rd(CPU_BASE_FILE)))
+        except (TypeError, ValueError):
+            return self.cpu_max
+
+    def cpu_pct(self, steps, base):
+        mhz = max(CONF["CPU_MIN_MHZ"], base - steps * CONF["CPU_STEP_MHZ"])
+        return min(100, -(-mhz * 100 // self.cpu_max))   # ceil
+
+    def limits(self, pol, mslc, mslg):
+        """-> (max_perf_pct, GPU cap in W or None) for the SMC requests"""
+        if not self.gpu_capable:
+            return self.cpu_pct(mslc, self.cpu_max), None
+        gpu_w = self.gpu_max - mslg * CONF["GPU_STEP_W"]
+        if pol != "adaptive":
+            return self.cpu_pct(mslc, self.cpu_max), max(self.gpu_min, gpu_w)
+        base = self.cpu_base()
+        hi, lo = CONF["ADAPTIVE_BUSY_GPU_BOUND"], CONF["ADAPTIVE_BUSY_CPU_BOUND"]
+        share = min(1.0, max(0.0, (hi - self.busy) / (hi - lo)))   # fraction of MSLC the GPU takes
+        gpu_steps = round(mslc * share)
+        cpu_steps = mslc - gpu_steps
+        step_w = CONF["ADAPTIVE_GPU_STEP_W"]
+        gpu_room = int((self.gpu_max - CONF["ADAPTIVE_GPU_FLOOR_W"]) / step_w)
+        cpu_room = max(0, (base - CONF["ADAPTIVE_CPU_FLOOR_MHZ"]) // CONF["CPU_STEP_MHZ"])
+        if gpu_steps > gpu_room:                  # GPU at its floor: rest to the CPU
+            cpu_steps += gpu_steps - gpu_room
+            gpu_steps = gpu_room
+        if cpu_steps > cpu_room:                  # CPU at its floor: rest to the GPU
+            gpu_steps += cpu_steps - cpu_room
+            cpu_steps = cpu_room
+        gpu_w = min(gpu_w, self.gpu_max - gpu_steps * step_w)
+        return self.cpu_pct(cpu_steps, base), max(self.gpu_min, gpu_w)
+
+    def update_busy(self):
+        b = self.gpu_busy() if self.gpu_active() else 0
+        a = INTERVAL / CONF["ADAPTIVE_BUSY_TAU"]
+        self.busy += a * ((b if b is not None else self.busy) - self.busy)
+
+    def apply(self, pct, cap_w):
+        if self.dry:
+            return
+        if rd(PSTATE) != str(pct):
+            write(PSTATE, pct)
+        if cap_w is not None and self.gpu_active():
+            cap = int(cap_w * 1e6)
+            try:
+                cur = int(rd(f"{self.gpu_hw}/power1_cap"))
+            except (TypeError, ValueError):
+                cur = None
+            if cur != cap:
+                write(f"{self.gpu_hw}/power1_cap", cap)
+
+    def restore(self):
+        if self.dry:
+            return
+        write(PSTATE, 100)
+        if self.gpu_capable and self.gpu_active():
+            write(f"{self.gpu_hw}/power1_cap", int(self.gpu_max * 1e6))
+
+def main():
+    ap = argparse.ArgumentParser(description="Obey the Apple SMC's P-state limit requests (T2 MacBooks).")
+    ap.add_argument("--dry-run", action="store_true", help="only print what would be set, change nothing")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("needs root (reading SMC keys by index and writing the limits)")
+    load_conf()
+
+    model = rd("/sys/class/dmi/id/product_name", "unknown")
+    if model not in TESTED_MODELS:
+        log(f"WARNING: {model} is untested (tested: {', '.join(sorted(TESTED_MODELS))}). "
+            f"Watch the log and please report results.")
+    if not os.path.exists(PSTATE):
+        sys.exit("intel_pstate not active (no max_perf_pct), can't cap the CPU")
+
+    keys = ["MSLC", "MSLG", "PZ0T", "PZ0F", "PZ0E"]
+    smc = SMC(find_smc(), keys)
+    c = Cruise(find_gpu(), args.dry_run)
+
+    def stop(*_):
+        c.restore()
+        log("t2-cruise: stopped" + ("" if args.dry_run else ", limits restored"))
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    if c.gpu_hw is None:
+        gpu_txt = "no AMD GPU power cap found, only the CPU follows the SMC"
+    elif not c.gpu_capable:
+        gpu_txt = (f"GPU power cap is locked at {c.gpu_max:.0f} W, only the CPU follows the SMC "
+                   f"(see gpu/pptable-powercap.py)")
+    else:
+        gpu_txt = f"GPU {c.gpu_min:.0f}-{c.gpu_max:.0f} W ({CONF['GPU_STEP_W']} W/step)"
+    log(f"t2-cruise on {model}: CPU {CONF['CPU_MIN_MHZ']}-{c.cpu_max} MHz ({CONF['CPU_STEP_MHZ']} MHz/step), "
+        f"{gpu_txt}, policy {c.policy()}{' [DRY RUN]' if args.dry_run else ''}")
+
+    last = None
+    while True:
+        v = smc.read(keys)
+        mslc, mslg = v["MSLC"][0], v["MSLG"][0]
+        pol = c.policy()
+        c.update_busy()
+        pct, cap = c.limits(pol, mslc, mslg)
+        c.apply(pct, cap)
+        if (pol, mslc, mslg) != last:
+            gpu = f"GPU {cap:.1f} W" if cap is not None else "GPU -"
+            busy = f" GPU busy {c.busy:3.0f}%" if pol == "adaptive" else ""
+            log(f"[{pol}] MSLC {mslc:2d} MSLG {mslg:2d}{busy} -> CPU {pct}% {gpu} | "
+                f"PZ0T {flt(v['PZ0T']):5.1f} PZ0F {flt(v['PZ0F']):5.1f}/{flt(v['PZ0E']):.1f} W")
+            last = (pol, mslc, mslg)
+        time.sleep(INTERVAL)
+
+if __name__ == "__main__":
+    main()

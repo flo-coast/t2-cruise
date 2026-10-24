@@ -1,0 +1,14 @@
+[Unit]
+Description=t2-cruise: obey the Apple SMC's P-state limit requests (T2 MacBooks)
+Documentation=https://github.com/flo-coast/t2-cruise
+# if you unlock the Radeon power cap at boot, start after that service, e.g.:
+# After=amdgpu-uclk-fix.service
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/bin/t2-cruised
+Restart=on-failure
+RestartSec=2
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target
