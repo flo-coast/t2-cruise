@@ -2,6 +2,12 @@
 
 **Cruise control for T2 MacBooks on Linux. No 800 MHz brakes under load.**
 
+> **See also [t2-zone-power](https://github.com/kaiT2en/KaiT2en-Fedora/tree/main/apps/t2-zone-power)** by
+> KaiT2en, which found the same mechanism independently and earlier (October 2026) and implements it more
+> completely. It reads the SMC's power limit record through the KaiT2en `t2smc` driver, reports the GPU step
+> counts and the CPU P-state range back to the SMC like macOS does, and also limits the iGPU and forced idle.
+> t2-cruise is the small read-only variant that needs no extra kernel module.
+
 ## The problem
 On a MacBookPro16,1 running Linux, a combined CPU and GPU load (a game, for example) makes the CPU drop to
 **800 MHz** after a few minutes. This happens again and again for several seconds at a time and shows up as
@@ -9,10 +15,14 @@ stutters, freezes and frame drops. The temperatures are normal when it happens.
 
 ## Why it happens
 The Apple SMC manages one power budget for CPU and GPU together, because both share one heat pipe. When the
-two draw more than the budget, the SMC sends **P-state limit requests**, `MSLC` for the CPU and `MSLG` for
-the GPU. macOS applies these requests, so the power drops a little and settles just under the budget.
+two draw more than the budget, the SMC sends **P-state limit steps** for the CPU and the GPU. macOS applies
+these steps, so the power drops a little and settles just under the budget.
 
-Linux doesn't read these requests. The power stays above the budget, the SMC's throttle level climbs to 100,
+The steps live in the SMC's power limit record, which macOS reads. The SMC also mirrors them in the debug
+keys `MSLC` (CPU) and `MSLG` (GPU), which can be read through the standard `applesmc` driver. t2-cruise uses
+these keys.
+
+Linux doesn't apply these steps. The power stays above the budget, the SMC's throttle level climbs to 100,
 and the SMC then asserts PROCHOT. PROCHOT forces the CPU to its lowest clock of 800 MHz.
 
 ## The fix
@@ -20,7 +30,7 @@ and the SMC then asserts PROCHOT. PROCHOT forces the CPU to its lowest clock of 
 - `MSLC` lowers the CPU ceiling by 100 MHz per step (via `intel_pstate`)
 - `MSLG` lowers the Radeon power cap by 2.5 W per step (optional, see [gpu/](gpu/))
 
-With the requests applied, the SMC's own control loop settles below the brake, like on macOS.
+With the steps applied, the SMC's own control loop settles below the brake, like on macOS.
 Details and measurements are in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 t2-cruise only reads the SMC and never writes to it. The only settings it changes are the CPU ceiling and the
@@ -84,7 +94,8 @@ If yours has them, please open an issue with your model, the output of
 
 ## Credits
 Reverse-engineered and written by **flo-coast** (2026), with Claude (Anthropic) as a coding assistant.
-Thanks to the [t2linux](https://t2linux.org) community, and to jahs for finding the Radeon memory clock bug
+Thanks to the [t2linux](https://t2linux.org) community, to KaiT2en and Byte for t2-zone-power and for
+pointing out that `MSLC`/`MSLG` are debug mirrors, and to jahs for finding the Radeon memory clock bug
 ([drm/amd #6005](https://gitlab.freedesktop.org/drm/amd/-/work_items/6005)) that made the Radeon usable in
 the first place.
 

@@ -1,7 +1,9 @@
 # Findings on the Apple SMC zone power controller (MacBookPro16,1)
 
 Reverse-engineered in October 2026 by flo-coast, by logging the SMC on Linux and on macOS
-under the same load. The machine is a MacBookPro16,1 (i9-9880H, Radeon Pro 5500M, board
+under the same load. KaiT2en found the same mechanism independently and earlier and built
+[t2-zone-power](https://github.com/kaiT2en/KaiT2en-Fedora/tree/main/apps/t2-zone-power) on it, which goes
+further (see the end of this document). The machine is a MacBookPro16,1 (i9-9880H, Radeon Pro 5500M, board
 Mac-E1008331FDC96864) with macOS 26.6 and Arch Linux with the t2linux kernel.
 
 ## The symptom
@@ -82,6 +84,19 @@ run at ~30-35 FPS. That is the hardware limit and not a brake.
   without `amdgpu.ppfeaturemask` (`gpu/pptable-powercap.py`).
 - Reading the SMC by index is shared state (`key_at_index` + `key_at_index_data`). Tools that read the SMC
   at the same time have to lock (`/run/t2-cruise/smc.lock`), otherwise they read each other's keys.
+
+## What t2-zone-power adds
+Byte from the KaiT2en project pointed out that `MSLC` and `MSLG` are debug mirrors. The actual interface is
+the SMC's power limit record (the `cmd 11` record that `macos/smcdump.c -plimit` reads, which was only sampled
+at idle here). t2-zone-power reads it through the KaiT2en `t2smc` driver and, like macOS, also writes back to
+the SMC.
+- `HE0N` / `HI0N` tell the SMC how many limit steps the dGPU and iGPU have (AGPM does this on macOS). Without
+  the dGPU count the SMC balances the heat pipe through the CPU alone.
+- `MSTS` / `MSPC` report the CPU P-state range (X86PlatformPlugin does this on macOS).
+- forced idle through `intel_powerclamp` and an iGPU limit as further actuators
+
+According to Byte this lowers the maximum temperature by about 10 °C. t2-cruise doesn't do any of this.
+It only reads, so the SMC here still balances mostly through the CPU.
 
 ## Open questions
 - Do other T2 models (MacBookPro15,x, 16,2/16,3, 16,4 with the 5600M, iMacs) have the same keys? Reports are
