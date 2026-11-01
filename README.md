@@ -78,6 +78,10 @@ The policy is set in `/etc/t2-cruise.conf` and can be switched at runtime with
 - **`adaptive`** (experimental) splits `MSLC` between CPU and GPU by GPU load. It gives the same FPS in games,
   but the GPU runs near 100 % and queues frames, which makes input feel laggier. Ideas are welcome.
 
+For benchmarks or game profiles you can put a lower ceiling on top of any policy. Write a CPU clock in MHz to
+`/run/t2-cruise/cpu_max_mhz` or a GPU power in W to `/run/t2-cruise/gpu_max_w`, and delete the file to lift it.
+These only ever lower the limits the SMC asks for.
+
 ## Tools
 | | |
 |---|---|

@@ -21,6 +21,7 @@ timeout 3 python3 -I /usr/local/bin/t2-cruised --dry-run || rc=$?
 # 124 = still running after 3 s, which is what we want
 [ $rc = 0 ] || [ $rc = 124 ] || { echo "dry run failed, not enabling the service"; exit 1; }
 systemctl daemon-reload
-systemctl enable --now t2-cruise.service
+systemctl enable t2-cruise.service
+systemctl restart t2-cruise.service   # an update must replace the running daemon
 echo
 echo "t2-cruise installed and running. Watch it work: journalctl -fu t2-cruise"

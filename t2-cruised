@@ -24,7 +24,9 @@ TESTED_MODELS = {"MacBookPro16,1"}
 CONF_FILE = "/etc/t2-cruise.conf"
 RUN_DIR = "/run/t2-cruise"
 POLICY_FILE = f"{RUN_DIR}/policy"
-CPU_BASE_FILE = f"{RUN_DIR}/cpu_max_mhz"   # optional CPU ceiling for the adaptive policy (e.g. a game profile)
+CPU_BASE_FILE = f"{RUN_DIR}/cpu_max_mhz"   # optional CPU ceiling in MHz (e.g. a game profile or a benchmark)
+GPU_RETRY_S = 10                           # look for a late amdgpu this often
+GPU_MAX_FILE = f"{RUN_DIR}/gpu_max_w"      # optional GPU power ceiling in W (benchmark); both only ever lower
 LOCK_FILE = f"{RUN_DIR}/smc.lock"          # other tools reading the SMC via key_at_index should take it too
 PSTATE = "/sys/devices/system/cpu/intel_pstate/max_perf_pct"
 INTERVAL = 0.5
@@ -139,12 +141,15 @@ class Cruise:
     def __init__(self, gpu, dry_run):
         self.dry = dry_run
         self.cpu_max = int(rd("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")) // 1000
+        self.attach(gpu)
+        self.busy = 0.0
+
+    def attach(self, gpu):
         self.gpu_dev, self.gpu_hw = gpu if gpu else (None, None)
         self.gpu_max = self.gpu_min = None
         if self.gpu_hw:
             self.gpu_max = int(rd(f"{self.gpu_hw}/power1_cap_max")) / 1e6
             self.gpu_min = int(rd(f"{self.gpu_hw}/power1_cap_min")) / 1e6
-        self.busy = 0.0
 
     @property
     def gpu_capable(self):
@@ -169,6 +174,12 @@ class Cruise:
         except (TypeError, ValueError):
             return self.cpu_max
 
+    def gpu_ceiling(self):
+        try:
+            return min(self.gpu_max, float(rd(GPU_MAX_FILE)))
+        except (TypeError, ValueError):
+            return self.gpu_max
+
     def cpu_pct(self, steps, base):
         mhz = max(CONF["CPU_MIN_MHZ"], base - steps * CONF["CPU_STEP_MHZ"])
         return min(100, -(-mhz * 100 // self.cpu_max))   # ceil
@@ -176,11 +187,11 @@ class Cruise:
     def limits(self, pol, mslc, mslg):
         """-> (max_perf_pct, GPU cap in W or None) for the SMC requests"""
         if not self.gpu_capable:
-            return self.cpu_pct(mslc, self.cpu_max), None
-        gpu_w = self.gpu_max - mslg * CONF["GPU_STEP_W"]
-        if pol != "adaptive":
-            return self.cpu_pct(mslc, self.cpu_max), max(self.gpu_min, gpu_w)
+            return self.cpu_pct(mslc, self.cpu_base()), None
+        gpu_w = min(self.gpu_max - mslg * CONF["GPU_STEP_W"], self.gpu_ceiling())
         base = self.cpu_base()
+        if pol != "adaptive":
+            return self.cpu_pct(mslc, base), max(self.gpu_min, gpu_w)
         hi, lo = CONF["ADAPTIVE_BUSY_GPU_BOUND"], CONF["ADAPTIVE_BUSY_CPU_BOUND"]
         share = min(1.0, max(0.0, (hi - self.busy) / (hi - lo)))   # fraction of MSLC the GPU takes
         gpu_steps = round(mslc * share)
@@ -260,19 +271,28 @@ def main():
         f"{gpu_txt}, policy {c.policy()}{' [DRY RUN]' if args.dry_run else ''}")
 
     last = None
+    gpu_retry = time.monotonic() + GPU_RETRY_S
     while True:
+        if c.gpu_hw is None and time.monotonic() >= gpu_retry:
+            # amdgpu can come up after us (e.g. modules loaded late at boot): keep looking
+            gpu_retry = time.monotonic() + GPU_RETRY_S
+            gpu = find_gpu()
+            if gpu:
+                c.attach(gpu)
+                log(f"AMD GPU power cap found late: {c.gpu_min:.0f}-{c.gpu_max:.0f} W"
+                    + ("" if c.gpu_capable else " (locked, only the CPU follows the SMC)"))
         v = smc.read(keys)
         mslc, mslg = v["MSLC"][0], v["MSLG"][0]
         pol = c.policy()
         c.update_busy()
         pct, cap = c.limits(pol, mslc, mslg)
         c.apply(pct, cap)
-        if (pol, mslc, mslg) != last:
+        if (pol, mslc, mslg, pct, cap) != last:
             gpu = f"GPU {cap:.1f} W" if cap is not None else "GPU -"
             busy = f" GPU busy {c.busy:3.0f}%" if pol == "adaptive" else ""
             log(f"[{pol}] MSLC {mslc:2d} MSLG {mslg:2d}{busy} -> CPU {pct}% {gpu} | "
                 f"PZ0T {flt(v['PZ0T']):5.1f} PZ0F {flt(v['PZ0F']):5.1f}/{flt(v['PZ0E']):.1f} W")
-            last = (pol, mslc, mslg)
+            last = (pol, mslc, mslg, pct, cap)
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
