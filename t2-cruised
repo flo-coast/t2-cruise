@@ -273,14 +273,18 @@ def main():
     last = None
     gpu_retry = time.monotonic() + GPU_RETRY_S
     while True:
-        if c.gpu_hw is None and time.monotonic() >= gpu_retry:
-            # amdgpu can come up after us (e.g. modules loaded late at boot): keep looking
+        if not c.gpu_capable and time.monotonic() >= gpu_retry:
+            # amdgpu can come up after us (modules loaded late at boot), and a pp_table upload
+            # (e.g. gpu/pptable-powercap.py at boot) can unlock the cap range after we found it
             gpu_retry = time.monotonic() + GPU_RETRY_S
             gpu = find_gpu()
             if gpu:
+                was = (c.gpu_hw, c.gpu_min, c.gpu_max)
                 c.attach(gpu)
-                log(f"AMD GPU power cap found late: {c.gpu_min:.0f}-{c.gpu_max:.0f} W"
-                    + ("" if c.gpu_capable else " (locked, only the CPU follows the SMC)"))
+                if (c.gpu_hw, c.gpu_min, c.gpu_max) != was:
+                    log(f"AMD GPU power cap {'found late' if was[0] is None else 'range changed'}: "
+                        f"{c.gpu_min:.0f}-{c.gpu_max:.0f} W"
+                        + ("" if c.gpu_capable else " (locked, only the CPU follows the SMC)"))
         v = smc.read(keys)
         mslc, mslg = v["MSLC"][0], v["MSLG"][0]
         pol = c.policy()
